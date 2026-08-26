@@ -39,11 +39,22 @@ import {
 } from '@plunk/ui';
 import {AnimatePresence, motion} from 'framer-motion';
 import {NextSeo} from 'next-seo';
-import {AlertTriangle, CreditCard, Database, Globe, Mail, Settings as SettingsIcon, Shield, Users} from 'lucide-react';
+import {
+  AlertTriangle,
+  CreditCard,
+  Database,
+  Globe,
+  Mail,
+  Send,
+  Settings as SettingsIcon,
+  Shield,
+  Users,
+} from 'lucide-react';
 import type {z} from 'zod';
 import {useRouter} from 'next/router';
 import {DashboardLayout} from '../../components/DashboardLayout';
 import {DomainsSettings} from '../../components/DomainsSettings';
+import {SendingProviderSettings} from '../../components/SendingProviderSettings';
 import {BillingLimits} from '../../components/BillingLimits';
 import {BillingConsumption} from '../../components/BillingConsumption';
 import {BillingInvoices} from '../../components/BillingInvoices';
@@ -61,7 +72,7 @@ import {useUser} from '../../lib/hooks/useUser';
 import {useProjectSecurity} from '../../lib/hooks/useProjectSecurity';
 import useSWR from 'swr';
 
-type TabId = 'general' | 'billing' | 'domains' | 'smtp' | 'data' | 'team' | 'security';
+type TabId = 'general' | 'billing' | 'sending' | 'domains' | 'smtp' | 'data' | 'team' | 'security';
 
 interface Tab {
   id: TabId;
@@ -77,6 +88,7 @@ const buildTabs = (options: {billingEnabled: boolean; smtpEnabled: boolean}): Ta
     {id: 'team', label: 'Team', icon: Users},
     {id: 'security', label: 'Security', icon: Shield},
     {id: 'billing', label: 'Billing', icon: CreditCard, condition: billingEnabled},
+    {id: 'sending', label: 'Sending', icon: Send},
     {id: 'domains', label: 'Domains', icon: Globe},
     {id: 'smtp', label: 'SMTP', icon: Mail, condition: smtpEnabled},
     {id: 'data', label: 'Data', icon: Database},
@@ -796,9 +808,17 @@ export default function Settings() {
               )}
             </TabsContent>
 
+            {/* Sending Tab */}
+            <TabsContent value="sending">
+              <SendingProviderSettings projectId={activeProject.id} />
+            </TabsContent>
+
             {/* Domains Tab */}
             <TabsContent value="domains">
-              <DomainsSettings projectId={activeProject.id} />
+              <DomainsSettings
+                projectId={activeProject.id}
+                smtpProviderNotice={activeProject.sendingProvider === 'SMTP'}
+              />
             </TabsContent>
 
             {/* SMTP Tab */}

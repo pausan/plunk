@@ -3,6 +3,8 @@ import {useForm} from 'react-hook-form';
 import {zodResolver} from '@hookform/resolvers/zod';
 import {DomainSchemas} from '@plunk/shared';
 import {
+  Alert,
+  AlertDescription,
   Badge,
   Button,
   Card,
@@ -22,7 +24,7 @@ import {
   Input,
 } from '@plunk/ui';
 import {AnimatePresence, motion} from 'framer-motion';
-import {Check, CheckCircle2, ChevronDown, Copy, Globe, RefreshCw, Trash2, XCircle} from 'lucide-react';
+import {Check, CheckCircle2, ChevronDown, Copy, Globe, Info, RefreshCw, Trash2, XCircle} from 'lucide-react';
 import {useConfig} from '../lib/hooks/useConfig';
 import {useAddDomain, useCheckDomainVerification, useDomains, useRemoveDomain} from '../lib/hooks/useDomains';
 
@@ -56,9 +58,16 @@ function AnimatedCopyIcon({isCopied}: {isCopied: boolean}) {
 
 interface DomainsSettingsProps {
   projectId: string;
+  /**
+   * True when the project's sending provider is a custom SMTP relay rather than
+   * AWS SES. Domain verification (DKIM via SES) only applies to SES, so we show
+   * an informational banner instead of hiding this tab — any domains verified
+   * from an earlier SES period, if present, still display below unaffected.
+   */
+  smtpProviderNotice?: boolean;
 }
 
-export function DomainsSettings({projectId}: DomainsSettingsProps) {
+export function DomainsSettings({projectId, smtpProviderNotice = false}: DomainsSettingsProps) {
   const {domains, mutate: mutateDomains, isLoading} = useDomains(projectId);
   const {addDomain} = useAddDomain();
   const {checkVerification} = useCheckDomainVerification();
@@ -257,6 +266,16 @@ export function DomainsSettings({projectId}: DomainsSettingsProps) {
 
   return (
     <div className="space-y-6">
+      {smtpProviderNotice && (
+        <Alert>
+          <Info className="h-4 w-4" />
+          <AlertDescription>
+            Domain verification applies to AWS SES only. Your custom SMTP relay must have its own SPF/DKIM configured
+            for the domains you send from.
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Add Domain Form */}
       <Card>
         <CardHeader>

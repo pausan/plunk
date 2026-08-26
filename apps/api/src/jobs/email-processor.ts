@@ -3,9 +3,9 @@
  * Processes individual emails from the queue (for all sources: transactional, campaign, workflow)
  */
 
-import {EmailStatus} from '@plunk/db';
+import {EmailStatus, SendingProviderType} from '@plunk/db';
 import type {SendEmailJobData} from '@plunk/types';
-import {type Job, Worker} from 'bullmq';
+import {DelayedError, type Job, Worker} from 'bullmq';
 import signale from 'signale';
 
 import {
@@ -16,13 +16,19 @@ import {
 } from '../app/constants.js';
 import {prisma} from '../database/prisma.js';
 import {CampaignService} from '../services/CampaignService.js';
+import {EmailAnalyticsService} from '../services/EmailAnalyticsService.js';
 import {bodyHasListManagementLink, buildEmailHeaders, classifyEmail} from '../services/EmailHeaderService.js';
 import {EmailService} from '../services/EmailService.js';
 import {EventService} from '../services/EventService.js';
 import {MeterService} from '../services/MeterService.js';
+import {NtfyService} from '../services/NtfyService.js';
+import {EmailSendError} from '../services/providers/EmailProvider.js';
+import {ProviderFactory} from '../services/providers/ProviderFactory.js';
 import {emailQueue} from '../services/QueueService.js';
+import {RateLimiterService} from '../services/RateLimiterService.js';
 import {SecurityService} from '../services/SecurityService.js';
-import {getSendingQuota, sendRawEmail} from '../services/SESService.js';
+import {getSendingQuota} from '../services/SESService.js';
+import {TrackingInjectionService} from '../services/TrackingInjectionService.js';
 
 /**
  * Determine the email sending rate limit (emails per second)
@@ -80,14 +86,14 @@ export async function createEmailWorker() {
   );
   const worker = new Worker<SendEmailJobData>(
     emailQueue.name,
-    async (job: Job<SendEmailJobData>) => {
+    async (job: Job<SendEmailJobData>, token?: string) => {
       const {emailId} = job.data;
 
       const email = await prisma.email.findUnique({
         where: {id: emailId},
         include: {
           contact: true,
-          project: true,
+          project: {include: {smtpConfig: true}},
           template: {select: {type: true}},
           campaign: {select: {type: true}},
         },
@@ -152,7 +158,7 @@ export async function createEmailWorker() {
 
         // Compile HTML with unsubscribe footer and badge.
         // Only marketing emails get the Plunk unsubscribe footer.
-        const compiledHtml = EmailService.compile({
+        let compiledHtml = EmailService.compile({
           content: formattedEmail.body,
           contact: email.contact,
           project: email.project,
@@ -197,6 +203,17 @@ export async function createEmailWorker() {
         // Determine tracking based on project settings and email type
         const shouldTrack = EmailService.shouldTrackEmail(email.project.tracking, email.sourceType);
 
+        // Resolve the provider for this project (SES by default, or the
+        // project's own SMTP relay). This is the single dispatch point that
+        // replaces the old direct SESService.sendRawEmail call.
+        const provider = await ProviderFactory.forProject(email.project);
+
+        // SES gets open/click tracking for free via its configuration sets — this
+        // injection only applies to providers that need Plunk to do it natively (SMTP).
+        if (provider.capabilities.injectsNativeTracking && shouldTrack) {
+          compiledHtml = TrackingInjectionService.inject(compiledHtml, email.id);
+        }
+
         // Check for phishing/dangerous content before sending
         const phishingCheck = await SecurityService.checkPhishingContent(
           email.projectId,
@@ -227,8 +244,25 @@ export async function createEmailWorker() {
           throw new Error(`Project ${email.projectId} has been disabled due to a policy violation`);
         }
 
-        // Send via AWS SES
-        const result = await sendRawEmail({
+        // Per-project SMTP throughput throttle. SES sends skip this entirely —
+        // SES behavior/throughput is unchanged from before this provider
+        // abstraction existed; it's still governed solely by the worker-level
+        // `limiter` below, sized from the AWS quota (or an env override).
+        if (email.project.sendingProvider === SendingProviderType.SMTP) {
+          const {maxPerSecond} = await provider.getThroughput();
+          const allowed = await RateLimiterService.tryConsume(`smtp:${email.projectId}`, maxPerSecond);
+
+          if (!allowed) {
+            // Throttled, not failed — don't burn a retry attempt or apply the
+            // exponential failure backoff. Re-arm this same job a moment later.
+            await job.moveToDelayed(Date.now() + 250, token);
+            throw new DelayedError();
+          }
+        }
+
+        // Send via the resolved provider (AWS SES by default, or the project's SMTP relay)
+        const result = await provider.send({
+          emailId: email.id,
           from: {
             name: fromName,
             email: fromEmail,
@@ -244,13 +278,14 @@ export async function createEmailWorker() {
           attachments: email.attachments as {filename: string; content: string; contentType: string}[] | null,
         });
 
-        // Mark as sent with SES message ID
+        // Mark as sent with the provider's message ID
         await prisma.email.update({
           where: {id: emailId},
           data: {
             status: EmailStatus.SENT,
             sentAt: new Date(),
             messageId: result.messageId,
+            sendingProvider: email.project.sendingProvider,
           },
         });
 
@@ -280,9 +315,57 @@ export async function createEmailWorker() {
           await CampaignService.finalizeIfDone(email.campaignId);
         }
       } catch (error) {
+        // A throttled-provider delay isn't a failure — let it propagate so BullMQ
+        // knows this job is now delayed, not errored (no status update, no retry
+        // consumed; the email row stays SENDING until the re-armed attempt runs).
+        if (error instanceof DelayedError) {
+          throw error;
+        }
+
+        if (error instanceof EmailSendError && error.kind === 'throttled') {
+          // The provider itself is throttling us (SES Throttling, SMTP 421) — same
+          // treatment as the pre-send rate-limit check above: delay without
+          // consuming a retry attempt or touching the email's status.
+          signale.warn(`[EMAIL-PROCESSOR] Provider throttled email ${emailId}, re-arming shortly: ${error.message}`);
+          await job.moveToDelayed(Date.now() + 2000, token);
+          throw new DelayedError();
+        }
+
+        if (error instanceof EmailSendError && error.kind === 'permanent') {
+          // Synchronous provider-side rejection (SES MessageRejected, SMTP 5xx) —
+          // this is a bounce, not a generic failure. Route it through the same
+          // shared analytics logic the SES SNS webhook uses, and don't retry: a
+          // permanently-rejected address will fail identically every time.
+          signale.warn(`[EMAIL-PROCESSOR] Permanent send rejection for email ${emailId}: ${error.message}`);
+          await EmailAnalyticsService.recordBounce(email, {
+            bounceType: 'Permanent',
+            synchronous: true,
+            reason: error.message,
+          });
+          return;
+        }
+
+        if (error instanceof EmailSendError && error.kind === 'auth') {
+          // Operator-config problem (bad SMTP credentials), not a per-email one —
+          // every subsequent send from this project will fail identically until
+          // fixed. Flag it and alert rather than retrying pointlessly.
+          signale.error(`[EMAIL-PROCESSOR] Provider auth failure for project ${email.projectId}: ${error.message}`);
+          await prisma.email.update({
+            where: {id: emailId},
+            data: {status: EmailStatus.FAILED, error: error.message},
+          });
+          await prisma.project.update({
+            where: {id: email.projectId},
+            data: {sendingProviderMisconfigured: true},
+          });
+          await NtfyService.notifySendingProviderMisconfigured(email.project.name, email.projectId, error.message);
+          return;
+        }
+
         signale.error(`[EMAIL-PROCESSOR] Failed to send email ${emailId}:`, error);
 
-        // Mark as failed
+        // Mark as failed (transient send errors, throttled-then-exhausted-retries,
+        // or any non-provider error — e.g. compile/format/DB failures)
         await prisma.email.update({
           where: {id: emailId},
           data: {

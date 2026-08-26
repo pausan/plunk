@@ -318,6 +318,23 @@ export class NtfyService {
   }
 
   /**
+   * Notify that a project's custom SMTP sending provider rejected our credentials
+   * (or connection) - HIGH priority, since every subsequent send from this
+   * project will fail identically until an operator fixes the config.
+   */
+  public static async notifySendingProviderMisconfigured(
+    projectName: string,
+    projectId: string,
+    reason: string,
+  ): Promise<void> {
+    await this.sendHigh(
+      'SMTP Sending Provider Misconfigured',
+      `Project "${projectName}" (${projectId}) failed to authenticate with its custom SMTP relay: ${reason}. Emails will keep failing until this is fixed.`,
+      [NtfyTag.WARNING, NtfyTag.SHIELD],
+    );
+  }
+
+  /**
    * Notify about new user account created via signup - LOW priority
    */
   public static async notifyUserSignup(userEmail: string, userId: string): Promise<void> {

@@ -105,7 +105,25 @@ export const SES_CONFIGURATION_SET_NO_TRACKING = validateEnv(
 // Check if no-tracking configuration set was explicitly provided (not using default)
 export const TRACKING_TOGGLE_ENABLED = process.env.SES_CONFIGURATION_SET_NO_TRACKING !== undefined;
 
-// SMTP Server Configuration (optional)
+// Custom SMTP Sending Provider (optional)
+// Per-project alternative to AWS SES — a project can configure its own SMTP relay
+// instead of sending through Plunk's shared AWS account (see SmtpConfig, ProviderFactory).
+// NOT related to the inbound SMTP relay server configured below.
+//
+// Required only once a project actually enables SMTP as its sending provider; the
+// settings endpoint fails the request (not the process) if these are unset when needed.
+export const SMTP_CREDENTIALS_ENCRYPTION_KEY = validateEnv('SMTP_CREDENTIALS_ENCRYPTION_KEY', '');
+// Optional — set during key rotation so ciphertext encrypted under the previous key can
+// still be decrypted (see SmtpConfig.keyVersion) while re-encrypting under the new key.
+export const SMTP_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS = validateEnv('SMTP_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS', '');
+// HMAC key signing the native open/click tracking URLs used for SMTP-sent mail.
+// Deliberately separate from the encryption key above (different blast radius if leaked).
+export const TRACKING_SIGNING_SECRET = validateEnv('TRACKING_SIGNING_SECRET', '');
+// Fallback per-project SMTP throughput when a project hasn't set SmtpConfig.maxSendRatePerSecond.
+// Generic SMTP has no dynamic quota API (unlike AWS SES's getSendQuota), so this is static.
+export const SMTP_DEFAULT_RATE_LIMIT_PER_SECOND = Number(validateEnv('SMTP_DEFAULT_RATE_LIMIT_PER_SECOND', '5'));
+
+// Inbound SMTP Relay Server Configuration (optional)
 // SMTP server can run with or without a domain (runs without TLS in dev mode)
 // Check if we should enable SMTP features in the UI
 export const SMTP_DOMAIN = validateEnv('SMTP_DOMAIN', 'localhost');

@@ -3,6 +3,8 @@ title: AWS SES Setup
 description: Configure email delivery
 ---
 
+AWS SES is the instance-wide default sending provider and the only one with full analytics support (native open/click tracking, async bounce/complaint handling, and DKIM domain verification), so most self-hosters should start here. If you'd rather not use AWS, individual projects can instead be pointed at a custom SMTP relay from the dashboard's **Sending** tab — see [Environment Variables](/self-hosting/environment-variables#custom-smtp-sending-provider) for the trade-offs (tracking, bounce detection, and domain verification all work differently over SMTP) and the env vars it requires.
+
 ## 1. Create IAM User
 
 1. Go to IAM Console → Users → Create user

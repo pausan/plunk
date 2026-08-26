@@ -1,5 +1,6 @@
 import React from 'react';
 import signale from 'signale';
+import {SendingProviderType} from '@plunk/db';
 import {DomainUnverifiedEmail, DomainVerifiedEmail, sendPlatformEmail} from '@plunk/email';
 import {DASHBOARD_URI, LANDING_URI} from '../app/constants.js';
 import {prisma} from '../database/prisma.js';
@@ -347,6 +348,16 @@ export class DomainService {
    * @throws HttpException if domain not found, not owned by project, or not verified
    */
   public static async verifyEmailDomain(email: string, projectId: string) {
+    // SMTP-provider projects skip domain verification entirely — the operator's
+    // own relay is trusted to already have SPF/DKIM configured for its sending
+    // domain(s). This is a single-function bypass rather than editing every call
+    // site: cheap (indexed PK lookup), and every call site already ignores the
+    // return value, so returning null here is safe everywhere.
+    const project = await prisma.project.findUnique({where: {id: projectId}, select: {sendingProvider: true}});
+    if (project?.sendingProvider === SendingProviderType.SMTP) {
+      return null;
+    }
+
     // Extract domain from email
     const emailParts = email.split('@');
     if (emailParts.length !== 2) {

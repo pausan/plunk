@@ -6854,6 +6854,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@types/nodemailer@npm:^8.0.1":
+  version: 8.0.1
+  resolution: "@types/nodemailer@npm:8.0.1"
+  dependencies:
+    "@types/node": "npm:*"
+  checksum: 10c0/4370ac478a6811faaa64fcf769556515c72b78c66961cde22be75bb975ce8a964cfbe5e7c0988a99250f3250faa34357c73958b019b3c63dd138ea3784442032
+  languageName: node
+  linkType: hard
+
 "@types/normalize-path@npm:3.0.2":
   version: 3.0.2
   resolution: "@types/normalize-path@npm:3.0.2"
@@ -7934,6 +7943,7 @@ __metadata:
     "@types/mailparser": "npm:^3.4.6"
     "@types/morgan": "npm:^1.9.9"
     "@types/multer": "npm:^2.0.0"
+    "@types/nodemailer": "npm:^8.0.1"
     "@types/sanitize-html": "npm:^2.16.1"
     "@types/signale": "npm:^1.4.7"
     "@zootools/email-spell-checker": "npm:^1.12.0"
@@ -7954,6 +7964,7 @@ __metadata:
     mailparser: "npm:^3.9.8"
     morgan: "npm:^1.10.0"
     multer: "npm:^2.2.0"
+    nodemailer: "npm:^9.0.5"
     sanitize-html: "npm:^2.17.4"
     signale: "npm:^1.4.0"
     stripe: "npm:^20.0.0"
@@ -15142,6 +15153,13 @@ __metadata:
   version: 8.0.5
   resolution: "nodemailer@npm:8.0.5"
   checksum: 10c0/5e8450499bd059c56d74ba96fa5f9928de2ecdae0d53c083dba5661d797114c1f9524d30f992d0263cc5a7dcf5a54b9c1d92dc1f766da150c9d0bde7d3798431
+  languageName: node
+  linkType: hard
+
+"nodemailer@npm:^9.0.5":
+  version: 9.0.5
+  resolution: "nodemailer@npm:9.0.5"
+  checksum: 10c0/60f7a21497c98c0d275cd12c488af581ef6aee65db575026319ac249dcac210bdab20edf77fe3158176ed3910f70d8c46d89abcd74f57a7170302727e6d05ee3
   languageName: node
   linkType: hard
 

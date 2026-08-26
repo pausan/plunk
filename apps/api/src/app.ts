@@ -33,7 +33,9 @@ import {Events} from './controllers/Events.js';
 import {Oauth} from './controllers/Oauth/index.js';
 import {Projects} from './controllers/Projects.js';
 import {Segments} from './controllers/Segments.js';
+import {SendingProvider} from './controllers/SendingProvider.js';
 import {Templates} from './controllers/Templates.js';
+import {Tracking} from './controllers/Tracking.js';
 import {Uploads} from './controllers/Uploads.js';
 import {Users} from './controllers/Users.js';
 import {Webhooks} from './controllers/Webhooks.js';
@@ -170,6 +172,8 @@ const server = new (class extends Server {
       new Workflows(),
       new Events(),
       new Config(),
+      new SendingProvider(),
+      new Tracking(),
     ]);
 
     this.app.get('/health', (req, res) => {

@@ -62,6 +62,12 @@ model Project {
   // Localization
   language String @default("en") // Language code for customer-facing content (ISO 639-1)
 
+  // Sending provider (AWS SES is the default/instance-wide provider; a project may
+  // opt into its own SMTP relay instead — see SmtpConfig)
+  sendingProvider              SendingProviderType @default(SES)
+  sendingProviderMisconfigured Boolean             @default(false) // set when the provider rejects auth; surfaced as a dashboard banner
+  smtpConfig                   SmtpConfig?
+
   // Relations
   members     Membership[]
   contacts    Contact[]
@@ -122,6 +128,48 @@ model Domain {
   @@index([projectId])
   @@index([projectId, verified])
   @@map("domains")
+}
+
+// Per-project custom SMTP relay config, used when Project.sendingProvider = SMTP.
+// Kept as its own table (rather than inline Project columns) so encrypted secret
+// material stays out of the hot, constantly-queried projects table and is never
+// pulled back by ordinary Project reads.
+model SmtpConfig {
+  id String @id @default(uuid())
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String  @unique
+
+  // Connection
+  host   String
+  port   Int
+  secure Boolean @default(true) // true = implicit TLS (465), false = STARTTLS/plain (587/25)
+
+  // Auth
+  username String
+
+  // Sender override (falls back to the from address on the Email/Template/Campaign if unset)
+  fromOverride String?
+
+  // Encrypted credential (AES-256-GCM) — never selected back in ordinary reads
+  encryptedPassword String
+  passwordIv        String
+  passwordAuthTag   String
+  keyVersion        Int    @default(1) // supports encryption-key rotation
+
+  // Static per-project throughput (no dynamic quota API for generic SMTP)
+  maxSendRatePerSecond Int @default(5)
+
+  // "Test connection" bookkeeping, surfaced in the dashboard
+  lastTestedAt  DateTime?
+  lastTestOk    Boolean?
+  lastTestError String?
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("smtp_configs")
 }
 
 // ============================================
@@ -533,8 +581,13 @@ model Email {
   headers     Json? // Custom email headers
   attachments Json? // Array of {filename: string, content: string (base64), contentType: string}
 
-  // AWS SES Message ID (for tracking webhooks)
+  // Provider message ID (SES or SMTP) — used for the SES SNS webhook lookup;
+  // informational only for SMTP sends, which have no async callback
   messageId String? @unique
+
+  // Snapshot of Project.sendingProvider at send time (historical accuracy if the
+  // project later switches providers). Null for emails sent before this field existed.
+  sendingProvider SendingProviderType?
 
   // Source - identifies how this email was triggered
   sourceType EmailSourceType
@@ -695,6 +748,11 @@ enum TrackingMode {
   ENABLED // Track opens and clicks for all emails
   DISABLED // No tracking for any emails
   MARKETING_ONLY // Track only marketing/campaign emails, not transactional
+}
+
+enum SendingProviderType {
+  SES // Plunk's shared AWS SES account (default)
+  SMTP // Project-supplied custom SMTP relay
 }
 
 enum CampaignStatus {

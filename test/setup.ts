@@ -32,6 +32,13 @@ if (process.env.REDIS_URL) {
 
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-key-for-testing';
+// Fixed, non-secret 32-byte keys for the SMTP sending-provider tests — the
+// "PREVIOUS" one is distinct on purpose so key-rotation fallback can be tested.
+process.env.SMTP_CREDENTIALS_ENCRYPTION_KEY =
+  process.env.SMTP_CREDENTIALS_ENCRYPTION_KEY || '9OutLY+mIIlbpqgCyhrRn7+o0GMoFOODkbGr/JEqtbw=';
+process.env.SMTP_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS =
+  process.env.SMTP_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS || 'rWVEIGPrkAEeVUz25kTIQOH4e6cFqY0dT+vYojZbSSE=';
+process.env.TRACKING_SIGNING_SECRET = process.env.TRACKING_SIGNING_SECRET || 'test-tracking-signing-secret';
 
 // Static import is safe: database.ts only reads env in initialize(), which runs
 // in beforeAll — well after the env mutations above.

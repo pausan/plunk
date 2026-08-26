@@ -1,5 +1,4 @@
 import {Controller, Post} from '@overnightjs/core';
-import type {Prisma} from '@plunk/db';
 import {EmailSourceType, EmailStatus} from '@plunk/db';
 import type {Request, Response} from 'express';
 import {simpleParser} from 'mailparser';
@@ -15,6 +14,7 @@ import {stripe} from '../app/stripe.js';
 import {prisma} from '../database/prisma.js';
 import {BillingLimitService} from '../services/BillingLimitService.js';
 import {ContactService} from '../services/ContactService.js';
+import {EmailAnalyticsService} from '../services/EmailAnalyticsService.js';
 import {EventService} from '../services/EventService.js';
 import {MembershipService} from '../services/MembershipService.js';
 import {MeterService} from '../services/MeterService.js';
@@ -284,7 +284,7 @@ export class Webhooks {
         }
       }
 
-      // Handle outbound email event notifications (existing logic)
+      // Handle outbound email event notifications
       const eventType = body.eventType as 'Bounce' | 'Delivery' | 'Open' | 'Complaint' | 'Click';
       const messageId = body.mail?.messageId;
 
@@ -307,164 +307,39 @@ export class Webhooks {
         return res.status(404).json({success: false, error: 'Email not found'});
       }
 
-      const now = new Date();
-      const updateData: Prisma.EmailUpdateInput = {};
-      const eventName = `email.${eventType.toLowerCase()}`;
-
-      // Base event data with email metadata
-      const baseEventData = {
-        subject: email.subject,
-        from: email.from,
-        fromName: email.fromName,
-        messageId: email.messageId,
-        emailId: email.id,
-        templateId: email.templateId,
-        campaignId: email.campaignId,
-        sourceType: email.sourceType,
-      };
-      let eventData: Record<string, unknown> = baseEventData;
-
-      // Process event based on type
+      // Delegate to EmailAnalyticsService — the shared, provider-agnostic
+      // implementation also used by the native SMTP tracking routes.
       switch (eventType) {
         case 'Delivery':
-          signale.success(`[WEBHOOK] Delivery confirmed for ${email.contact.email} from ${email.project.name}`);
-          updateData.status = EmailStatus.DELIVERED;
-          updateData.deliveredAt = now;
-          eventData = {
-            ...baseEventData,
-            deliveredAt: now.toISOString(),
-          };
+          await EmailAnalyticsService.recordDelivery(email);
           break;
 
         case 'Open':
-          signale.success(`[WEBHOOK] Open received for ${email.contact.email} from ${email.project.name}`);
-          // Only set openedAt on first open
-          if (!email.openedAt) {
-            updateData.openedAt = now;
-          }
-          updateData.opens = (email.opens || 0) + 1;
-          updateData.status = EmailStatus.OPENED;
-          eventData = {
-            ...baseEventData,
-            openedAt: email.openedAt?.toISOString() || now.toISOString(),
-            opens: (email.opens || 0) + 1,
-            isFirstOpen: !email.openedAt,
-          };
+          await EmailAnalyticsService.recordOpen(email);
           break;
 
-        case 'Click': {
-          signale.success(`[WEBHOOK] Click received for ${email.contact.email} from ${email.project.name}`);
-          const clickedLink = body.click?.link;
-          // Only set clickedAt on first click
-          if (!email.clickedAt) {
-            updateData.clickedAt = now;
-          }
-          updateData.clicks = (email.clicks || 0) + 1;
-          updateData.status = EmailStatus.CLICKED;
-          eventData = {
-            ...baseEventData,
-            link: clickedLink,
-            clickedAt: email.clickedAt?.toISOString() || now.toISOString(),
-            clicks: (email.clicks || 0) + 1,
-            isFirstClick: !email.clickedAt,
-          };
+        case 'Click':
+          await EmailAnalyticsService.recordClick(email, body.click?.link);
           break;
-        }
 
         case 'Bounce': {
-          const bounceType = body.bounce?.bounceType;
-          const isPermanentBounce = bounceType === 'Permanent';
-          const isTransientBounce = bounceType === 'Transient';
-
-          if (isPermanentBounce) {
-            // Hard bounce - counts toward bounce rate and unsubscribes contact
-            signale.warn(`[WEBHOOK] Permanent bounce received for ${email.contact.email} from ${email.project.name}`);
-            updateData.status = EmailStatus.BOUNCED;
-            updateData.bouncedAt = now;
-            // Unsubscribe contact on permanent bounce
-            await prisma.contact.update({
-              where: {id: email.contactId},
-              data: {subscribed: false},
-            });
-            eventData = {
-              ...baseEventData,
-              bounceType,
-              bouncedAt: now.toISOString(),
-            };
-
-            // Send notification about permanent bounce
-            await NtfyService.notifyEmailBounce(email.project.name, email.projectId, email.contact.email, bounceType);
-          } else if (isTransientBounce) {
-            // Soft bounce (e.g., out-of-office, mailbox full) - don't count toward bounce rate
-            signale.info(
-              `[WEBHOOK] Transient bounce received for ${email.contact.email} from ${email.project.name} (not counted toward bounce rate)`,
-            );
-            // Don't update email status or unsubscribe contact
-            // Just track the event for visibility
-            eventData = {
-              ...baseEventData,
-              bounceType,
-              transientBounce: true,
-            };
-          } else {
-            // Unknown bounce type - treat as permanent to be safe
-            signale.warn(
-              `[WEBHOOK] Unknown bounce type (${bounceType}) received for ${email.contact.email} from ${email.project.name} - treating as permanent`,
-            );
-            updateData.status = EmailStatus.BOUNCED;
-            updateData.bouncedAt = now;
-            await prisma.contact.update({
-              where: {id: email.contactId},
-              data: {subscribed: false},
-            });
-            eventData = {
-              ...baseEventData,
-              bounceType,
-              bouncedAt: now.toISOString(),
-            };
-
-            await NtfyService.notifyEmailBounce(email.project.name, email.projectId, email.contact.email, bounceType);
-          }
+          // Unknown bounce types are treated as permanent, same as before this
+          // was extracted — only an explicit 'Transient' type is a soft bounce.
+          const rawType = body.bounce?.bounceType;
+          await EmailAnalyticsService.recordBounce(email, {
+            bounceType: rawType === 'Transient' ? 'Transient' : 'Permanent',
+            rawType,
+          });
           break;
         }
 
         case 'Complaint':
-          signale.warn(`[WEBHOOK] Complaint received for ${email.contact.email} from ${email.project.name}`);
-          updateData.status = EmailStatus.COMPLAINED;
-          updateData.complainedAt = now;
-          // Unsubscribe contact on complaint
-          await prisma.contact.update({
-            where: {id: email.contactId},
-            data: {subscribed: false},
-          });
-          eventData = {
-            ...baseEventData,
-            complainedAt: now.toISOString(),
-          };
-
-          // Send notification about complaint
-          await NtfyService.notifyEmailComplaint(email.project.name, email.projectId, email.contact.email);
+          await EmailAnalyticsService.recordComplaint(email);
           break;
 
         default:
           signale.warn(`[WEBHOOK] Unknown event type: ${eventType}`);
           return res.status(200).json({success: true});
-      }
-
-      // Update email with new status and timestamps
-      await prisma.email.update({
-        where: {id: email.id},
-        data: updateData,
-      });
-
-      // Track event (this will trigger workflows)
-      await EventService.trackEvent(email.projectId, eventName, email.contactId, email.id, eventData);
-
-      // Check security limits only for permanent bounces and complaints
-      // Transient bounces (soft bounces) don't count toward bounce rate
-      const isPermanentBounce = eventType === 'Bounce' && body.bounce?.bounceType === 'Permanent';
-      if (isPermanentBounce || eventType === 'Complaint') {
-        await SecurityService.checkAndEnforceSecurityLimits(email.projectId);
       }
 
       signale.success(`[WEBHOOK] Processed ${eventType} event for email ${email.id}`);

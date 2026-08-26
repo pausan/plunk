@@ -38,6 +38,21 @@ Set your subdomains here. The application automatically derives all internal and
 | `SES_CONFIGURATION_SET_NO_TRACKING` | No       | A second SES configuration set without tracking. When set, projects can toggle email tracking on/off. If omitted, the tracking toggle is hidden. | `plunk-no-tracking-configuration-set` (default) |
 | `MAIL_FROM_SUBDOMAIN`               | No       | Subdomain prefix used when constructing the MAIL FROM hostname for a verified domain (e.g. with default `plunk` and domain `yourdomain.com`, the MAIL FROM is `plunk.yourdomain.com`). Override when the default subdomain is already in use (e.g. by an R2/CDN custom domain), since the MAIL FROM hostname needs MX + TXT records that can't coexist with a CNAME. | `plunk`                                         |
 
+## Custom SMTP Sending Provider
+
+Lets individual projects send through their own SMTP relay instead of AWS SES above (configured per-project from the dashboard's **Sending** tab). This is unrelated to the inbound **SMTP Server** relay further below — that one *receives* mail submitted by SMTP clients and forwards it to `POST /v1/send`; this one is an alternative *outbound* delivery path.
+
+Required only once a project actually enables SMTP as its sending provider — leave unset if you don't need this feature. When enabled for a project, Plunk injects its own open/click tracking pixel and links into the email (since generic SMTP has no equivalent to SES's configuration-set tracking), and only detects bounces synchronously — a relay's immediate rejection at send time. There's no async complaint or soft-bounce feedback loop for SMTP, and domain/DKIM verification doesn't apply — the relay is trusted to already have SPF/DKIM configured for the domains it sends from.
+
+| Variable                                | Required | Description                                                                                                                             | Default |
+| ---------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `SMTP_CREDENTIALS_ENCRYPTION_KEY`        | No\*     | 32-byte key (base64-encoded) encrypting per-project SMTP passwords at rest (AES-256-GCM). Generate with `openssl rand -base64 32`.        | —       |
+| `SMTP_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS` | No     | Previous encryption key, set temporarily during key rotation so already-stored credentials remain decryptable while re-saving onto the new key. | —       |
+| `TRACKING_SIGNING_SECRET`                | No\*     | Secret signing the native open/click tracking URLs used for SMTP-sent mail. Generate with `openssl rand -base64 32`.                      | —       |
+| `SMTP_DEFAULT_RATE_LIMIT_PER_SECOND`     | No       | Fallback per-project SMTP throughput (emails/second) when a project hasn't set its own rate limit. Generic SMTP has no quota API to query like AWS SES does. | `5`     |
+
+\* Required once any project on this instance enables SMTP as its sending provider; saving a project's SMTP config fails with a clear error if unset.
+
 ## Storage (Minio)
 
 The bundled Docker setup includes Minio with defaults that work out of the box. Only change these when connecting to an external S3-compatible bucket.

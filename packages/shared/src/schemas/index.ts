@@ -1,4 +1,11 @@
-import {CampaignAudienceType, TemplateType, TrackingMode, WorkflowStepType, WorkflowTriggerType} from '@plunk/db';
+import {
+  CampaignAudienceType,
+  SendingProviderType,
+  TemplateType,
+  TrackingMode,
+  WorkflowStepType,
+  WorkflowTriggerType,
+} from '@plunk/db';
 import type {FilterCondition, FilterGroup} from '@plunk/types';
 import {z} from 'zod';
 
@@ -402,6 +409,35 @@ export const DomainSchemas = {
   }),
   projectId: z.object({
     projectId: uuid,
+  }),
+};
+
+export const SendingProviderSchemas = {
+  update: z.object({
+    sendingProvider: z.nativeEnum(SendingProviderType),
+    // Optional even when sendingProvider is SMTP — a project may already have a
+    // saved SmtpConfig and just be switching back to it; the controller enforces
+    // that a config exists (in the request or in the DB) before accepting SMTP.
+    smtpConfig: z
+      .object({
+        host: z.string().min(1).max(255),
+        port: z.number().int().min(1).max(65535),
+        secure: z.boolean(),
+        username: z.string().min(1).max(255),
+        // Omitted on update = keep the existing encrypted password
+        password: z.string().min(1).max(1024).optional(),
+        fromOverride: email.nullable().optional(),
+        maxSendRatePerSecond: z.number().int().min(1).max(1000).optional(),
+      })
+      .optional(),
+  }),
+  test: z.object({
+    host: z.string().min(1).max(255),
+    port: z.number().int().min(1).max(65535),
+    secure: z.boolean(),
+    username: z.string().min(1).max(255),
+    // Optional here too — testing an already-saved config without retyping the password
+    password: z.string().min(1).max(1024).optional(),
   }),
 };
 

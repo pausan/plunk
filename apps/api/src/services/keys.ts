@@ -98,4 +98,13 @@ export const Keys = {
       return `project:public:${key}`;
     },
   },
+  EmailProvider: {
+    sesQuota(): string {
+      return 'email_provider:ses_quota';
+    },
+    // bucketKey is `smtp:<projectId>` — see RateLimiterService
+    rateLimitWindow(bucketKey: string, windowSeconds: number): string {
+      return `email_provider:rate_limit:${bucketKey}:${windowSeconds}`;
+    },
+  },
 } as const;
