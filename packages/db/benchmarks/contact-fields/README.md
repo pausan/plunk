@@ -82,6 +82,24 @@ Accuracy of each sampled shape against the exact pass:
 
 All three miss the same field: `recentlyAdded`.
 
+### The cached path
+
+The numbers above are all cache *misses*. What the dashboard actually hits, measured
+separately against a 36-field payload (2,114 bytes — the same shape this corpus
+produces), 1000 samples after warm-up:
+
+| | ms |
+|---|---|
+| p50 | 0.063 |
+| p95 | 0.143 |
+| p99 | 0.215 |
+| max | 3.977 |
+
+That is a Redis `GET` plus a `JSON.parse`, so it scales with the number of fields, not
+the number of contacts — a 2M-contact tenant and a 200-contact tenant pay the same.
+Measured at the service method, so it excludes HTTP, auth middleware and serialization,
+and Redis was on loopback; a managed Redis adds its round trip.
+
 ## Reading the results
 
 **The count was never the problem.** 51 ms against 38 s. It is also now issued alongside
