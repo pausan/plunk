@@ -28,6 +28,7 @@ read -r -a SAMPLES <<<"${BENCH_SAMPLES:-10000 50000 200000}"
 PROJECT="bench_main"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_PKG="$(cd "$HERE/../.." && pwd)"
+REPO_ROOT="$(cd "$DB_PKG/../.." && pwd)"
 
 cleanup() {
   if [[ "${BENCH_KEEP:-0}" == "1" ]]; then
@@ -169,6 +170,33 @@ GROUP BY kv.key
 SQL
 }
 
+# --- drift guard ---------------------------------------------------------------
+# The benchmark hardcodes the candidate query, so it can silently drift from the one
+# that actually ships. The contact-search benchmark avoids this by replaying its
+# migration file verbatim; there is no equivalent here, because this query lives inline
+# in a Prisma $queryRaw. So compare the two texts instead and say so loudly when they
+# diverge -- a benchmark quietly measuring a query nobody runs is worse than no
+# benchmark, because the numbers still look authoritative.
+check_shipped_query() {
+  local service="$REPO_ROOT/apps/api/src/services/ContactService.ts"
+
+  [[ -f "$service" ]] || return 0
+
+  local shipped benched
+  shipped=$(sed -n '/kv.key AS key,/,/GROUP BY kv.key/p' "$service" |
+    tr -s ' \n\t' ' ' | sed 's/${projectId}/PROJ/g' | tr -d ' ')
+  benched=$(onepass_exact_sql | sed -n '/kv.key AS key,/,/GROUP BY kv.key/p' |
+    tr -s ' \n\t' ' ' | sed "s/'$PROJECT'/PROJ/g" | tr -d ' ')
+
+  if [[ "$shipped" != "$benched" ]]; then
+    echo "    WARNING: the 'single-pass exact' shape below no longer matches"
+    echo "             ContactService.getAvailableFields. The 'after' numbers do not"
+    echo "             describe what ships until one of the two is brought back in line."
+  else
+    echo "    single-pass exact matches ContactService.getAvailableFields"
+  fi
+}
+
 # --- result materialization ---------------------------------------------------
 # Same SQL that was timed, stored so the accuracy comparison measures the shape that
 # was actually benchmarked rather than a re-derivation of it.
@@ -211,6 +239,8 @@ TOTAL=$(psqlq -c "$(count_sql)")
 KEYS=$(psqlq -c "SELECT count(DISTINCT k) FROM contacts, LATERAL jsonb_object_keys(data) k WHERE \"projectId\" = '$PROJECT';")
 SIZE=$(psqlq -c "SELECT pg_size_pretty(pg_total_relation_size('contacts'));")
 echo "    $TOTAL contacts in '$PROJECT', $KEYS distinct custom fields, contacts table $SIZE"
+
+check_shipped_query
 
 echo "==> measuring count(*) (the coverage denominator)"
 T_COUNT=$(timed "$(count_sql)")

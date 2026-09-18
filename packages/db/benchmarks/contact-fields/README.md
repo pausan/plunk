@@ -41,6 +41,21 @@ Sampled shapes are also checked for *accuracy* against the exact pass: how many 
 they fail to discover, how far their coverage percentages drift, and whether they infer
 a different type.
 
+### Keeping it honest
+
+The candidate query is written out in `run.sh` rather than imported, so it can drift from
+the one that actually ships. The contact-search benchmark avoids this by replaying its
+migration file verbatim; there is no equivalent here, because this query lives inline in
+a Prisma `$queryRaw`. Instead the run compares the two texts and prints
+
+```
+single-pass exact matches ContactService.getAvailableFields
+```
+
+before measuring, and warns loudly if they have diverged. A benchmark quietly measuring a
+query nobody runs is worse than no benchmark, because the numbers still look
+authoritative.
+
 ## Results at 2M contacts
 
 Postgres 16, `en_US.utf8`, `shared_buffers=2GB`, warm cache, median of 3.
