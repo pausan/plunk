@@ -84,6 +84,16 @@ Rate limiting is **off by default** — upgrading Plunk will never start refusin
 
 Contact writes share one budget because a sync integration drives create, update and delete from the same upstream change feed — separate budgets would let a single runaway sync spend three times the intended allowance.
 
+## Contact Fields Cache
+
+The segment builder, workflow conditions and template editor all need the list of custom fields stored in `Contact.data`. Discovering those keys means scanning every contact in the project, so the result is cached per project instead of being computed on each request.
+
+| Variable                         | Required | Description                                                                                                                                                                           | Default |
+| -------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `CONTACT_FIELDS_CACHE_TTL_HOURS` | No       | How long a computed field list is served before it is recomputed. A stale list is served while the refresh runs behind it, so nobody waits for the scan. Lower it if you add custom fields often. | `4`     |
+
+A field written for the first time after the last scan will not appear until the list is recomputed. Deleting a field invalidates the cache immediately, and the segment builder has a **Refresh fields** control that forces a rescan on demand — so lowering this is rarely necessary.
+
 ## Idempotency
 
 Callers can pass an `Idempotency-Key` header to `POST /v1/track` and `POST /v1/send` to guarantee the request runs at most once. See [Idempotency](/guides/idempotency).

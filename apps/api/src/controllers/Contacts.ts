@@ -86,6 +86,9 @@ export class Contacts {
    * GET /contacts/fields
    * Get all available contact fields (both standard and custom fields from data JSON)
    * Returns field names with inferred types (string, number, boolean, date)
+   *
+   * Served from a per-project cache, so this is cheap to call on mount. `computedAt`
+   * says when the underlying scan ran; POST fields/refresh forces a new one.
    */
   @Get('fields')
   @Middleware([requireAuth, requireEmailVerified])
@@ -94,16 +97,52 @@ export class Contacts {
     const auth = res.locals.auth;
 
     try {
-      const fieldsWithTypes = await ContactService.getAvailableFields(auth.projectId!);
+      const {fields, computedAt} = await ContactService.getAvailableFields(auth.projectId!);
 
       return res.status(200).json({
-        fields: fieldsWithTypes,
-        count: fieldsWithTypes.length,
+        fields,
+        count: fields.length,
+        computedAt,
       });
     } catch (error) {
       signale.error('[CONTACTS] Failed to get available fields:', error);
       return res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to get available fields',
+      });
+    }
+  }
+
+  /**
+   * POST /contacts/fields/refresh
+   * Recompute the available contact fields now, bypassing the cache.
+   *
+   * Field discovery has to read every contact in the project, so the list behind
+   * GET fields is hours old by design. This is the escape hatch for the case that
+   * actually matters -- someone just started writing a new custom field and wants to
+   * segment on it -- rather than making everyone pay for freshness on every request.
+   *
+   * Synchronous: the caller is a person who pressed a button and is watching a spinner,
+   * and the scan is seconds even at several million contacts. Concurrent refreshes for
+   * the same project collapse onto a single scan in the service.
+   */
+  @Post('fields/refresh')
+  @Middleware([requireAuth, requireEmailVerified])
+  @CatchAsync
+  public async refreshAvailableFields(req: Request, res: Response, _next: NextFunction) {
+    const auth = res.locals.auth;
+
+    try {
+      const {fields, computedAt} = await ContactService.getAvailableFields(auth.projectId!, {forceRefresh: true});
+
+      return res.status(200).json({
+        fields,
+        count: fields.length,
+        computedAt,
+      });
+    } catch (error) {
+      signale.error('[CONTACTS] Failed to refresh available fields:', error);
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to refresh available fields',
       });
     }
   }

@@ -139,6 +139,13 @@ export const MAX_ATTACHMENT_SIZE_MB = Number(validateEnv('MAX_ATTACHMENT_SIZE_MB
 // Maximum number of attachments per email (default: 10)
 export const MAX_ATTACHMENTS_COUNT = Number(validateEnv('MAX_ATTACHMENTS_COUNT', '10'));
 
+// Contact Fields Cache (optional)
+// How long the computed contact-field list is served before it is recomputed (default: 4 hours).
+// Discovering the custom fields inside Contact.data means reading every contact in the project,
+// so this is deliberately long. The segment builder has a refresh control for the case where a
+// newly-added field needs to show up before the window is up.
+export const CONTACT_FIELDS_CACHE_TTL_HOURS = Number(validateEnv('CONTACT_FIELDS_CACHE_TTL_HOURS', '4'));
+
 // Idempotency (optional)
 // How long a used Idempotency-Key stays claimed before it can be reused (default: 24 hours)
 export const IDEMPOTENCY_KEY_TTL_HOURS = Number(validateEnv('IDEMPOTENCY_KEY_TTL_HOURS', '24'));

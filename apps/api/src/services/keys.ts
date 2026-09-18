@@ -122,6 +122,25 @@ export const Keys = {
       return 'campaign:stats_dirty';
     },
   },
+  Contact: {
+    /**
+     * The computed field list for a project. See ContactService.getAvailableFields --
+     * building this reads every contact in the project, so it is served from here and
+     * only recomputed on expiry, on an explicit refresh, or when a field is deleted.
+     */
+    fields(projectId: string): string {
+      return `contact:fields:${projectId}`;
+    },
+
+    /**
+     * Held while the field list is being recomputed, so a project whose cache has just
+     * gone stale starts one scan rather than one per in-flight request. Expires on its
+     * own, so an instance that dies mid-scan does not wedge the project.
+     */
+    fieldsRefreshLock(projectId: string): string {
+      return `contact:fields_refresh:${projectId}`;
+    },
+  },
   Project: {
     id(id: string): string {
       return `project:id:${id}`;

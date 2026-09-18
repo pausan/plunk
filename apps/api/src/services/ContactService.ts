@@ -1,5 +1,8 @@
 import {type Contact, Prisma} from '@plunk/db';
 import type {
+  ContactField,
+  ContactFieldList,
+  ContactFieldType,
   ContactSubscriptionStatus,
   CursorPaginatedResponse,
   FilterCondition,
@@ -9,9 +12,12 @@ import type {
 import {toPrismaJson} from '@plunk/types';
 import signale from 'signale';
 
+import {CONTACT_FIELDS_CACHE_TTL_HOURS} from '../app/constants.js';
 import {prisma} from '../database/prisma.js';
+import {redis} from '../database/redis.js';
 import {HttpException} from '../exceptions/index.js';
 import {EventService} from './EventService.js';
+import {Keys} from './keys.js';
 
 export class ContactService {
   /**
@@ -774,106 +780,255 @@ export class ContactService {
   }
 
   /**
-   * Get all available contact fields for a project
-   * Returns both standard fields and custom fields from the data JSON column
-   * Now includes type information inferred from actual data
+   * Standard `Contact` columns. Present on every contact by construction, so they carry
+   * 100% coverage and take no part in the scan below.
+   */
+  private static readonly STANDARD_FIELDS: ContactField[] = [
+    {field: 'email', type: 'string', coverage: 100},
+    {field: 'subscribed', type: 'boolean', coverage: 100},
+    {field: 'createdAt', type: 'date', coverage: 100},
+    {field: 'updatedAt', type: 'date', coverage: 100},
+  ];
+
+  /**
+   * How long a background refresh may run before the lock is assumed abandoned. Well
+   * above the worst scan time measured at 2M contacts, so it expires because an instance
+   * died rather than because the scan was slow.
+   */
+  private static readonly FIELDS_REFRESH_LOCK_SECONDS = 10 * 60;
+
+  /** ISO 8601, the shape the API writes when a date is stored in a custom field. */
+  private static readonly ISO_DATE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{3})?Z?)?$/;
+
+  /** How long a computed field list is served before it is treated as stale. */
+  private static get fieldsTtlSeconds(): number {
+    return CONTACT_FIELDS_CACHE_TTL_HOURS * 60 * 60;
+  }
+
+  /**
+   * Get all available contact fields for a project: the standard `Contact` columns plus
+   * every key found inside the `Contact.data` JSON, each with an inferred type and the
+   * share of contacts carrying it.
+   *
+   * Served from Redis, because computing it has to read every contact in the project.
+   * No index can enumerate the distinct keys of a jsonb column -- a GIN index answers
+   * "which rows have this key", not "which keys exist" -- so discovery is a heap scan
+   * however it is written, and at a few million contacts that is seconds. The segment
+   * builder, the workflow condition editor and the template editor all ask for this on
+   * mount, which made it the slowest thing in the dashboard (#487).
+   *
+   * Freshness is what pays for that: a field first written a minute ago may not show up
+   * until the entry is recomputed. Two things bound the staleness -- deleting a field
+   * invalidates the entry immediately, and `POST /contacts/fields/refresh` recomputes on
+   * demand, which is what the segment builder's refresh control calls.
    *
    * @param projectId - The project ID to filter contacts
-   * @returns Array of field objects with name and type
+   * @param options.forceRefresh - Recompute now and replace the cached entry
    */
   public static async getAvailableFields(
     projectId: string,
-  ): Promise<Array<{field: string; type: 'string' | 'number' | 'boolean' | 'date'; coverage: number}>> {
-    // Get total contact count for coverage calculation
-    const totalContacts = await prisma.contact.count({
-      where: {projectId},
-    });
+    options: {forceRefresh?: boolean} = {},
+  ): Promise<ContactFieldList> {
+    const cached = await this.readCachedFields(projectId);
 
-    // Standard fields with known types (always 100% coverage)
-    const standardFields = [
-      {field: 'email', type: 'string' as const, coverage: 100},
-      {field: 'subscribed', type: 'boolean' as const, coverage: 100},
-      {field: 'createdAt', type: 'date' as const, coverage: 100},
-      {field: 'updatedAt', type: 'date' as const, coverage: 100},
-    ];
+    if (options.forceRefresh) {
+      // Behind the same lock as the background refresh, so holding the button down
+      // starts one scan rather than one per click. A caller that loses that race is
+      // handed whatever is cached: the scan it wanted is already running.
+      const refreshed = await this.recomputeFields(projectId);
 
-    // Get custom fields from the data JSON column with type inference and coverage
-    // Use raw SQL to extract all keys, sample values, and contact counts from the JSON data column
-    const result = await prisma.$queryRaw<
-      Array<{key: string; sample_value: string; json_type: string; contact_count: bigint}>
-    >`
-      WITH field_keys AS (
-        SELECT DISTINCT jsonb_object_keys(data) as key
-        FROM contacts
-        WHERE
-          "projectId" = ${projectId}
-          AND data IS NOT NULL
-          AND jsonb_typeof(data) = 'object'
-      ),
-      field_samples AS (
+      return refreshed ?? cached ?? this.computeAndCacheFields(projectId);
+    }
+
+    if (!cached) {
+      return this.computeAndCacheFields(projectId);
+    }
+
+    // A stale entry is still returned. It is a list of field names: one a few hours old
+    // is worth far more than making this caller sit through a full scan. The recompute
+    // runs behind the response, so the next caller gets the fresh list.
+    if (this.isFieldsEntryStale(cached)) {
+      void this.refreshFieldsInBackground(projectId);
+    }
+
+    return cached;
+  }
+
+  /**
+   * Drop a project's cached field list, so the next read recomputes.
+   *
+   * Called when a field is deleted. Deliberately *not* called when contacts are written:
+   * that is the hottest path in the product and every import would invalidate the entry
+   * it just paid to build, which is the whole problem this cache exists to solve.
+   */
+  public static async invalidateAvailableFields(projectId: string): Promise<void> {
+    await redis.del(Keys.Contact.fields(projectId));
+  }
+
+  private static async readCachedFields(projectId: string): Promise<ContactFieldList | null> {
+    const raw = await redis.get(Keys.Contact.fields(projectId));
+
+    if (!raw) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(raw) as ContactFieldList;
+    } catch {
+      // An entry written by an older shape, or edited by hand, is not worth failing a
+      // request over. Treat it as a miss and recompute.
+      return null;
+    }
+  }
+
+  private static isFieldsEntryStale(entry: ContactFieldList): boolean {
+    const age = Date.now() - new Date(entry.computedAt).getTime();
+
+    // An unparseable timestamp is stale by definition, not fresh forever.
+    return !Number.isFinite(age) || age > this.fieldsTtlSeconds * 1000;
+  }
+
+  /**
+   * Recompute and store.
+   *
+   * Written with twice the TTL it is considered fresh for, so that once an entry goes
+   * stale there is still a copy to serve while the refresh behind it runs. Without that
+   * second window, every expiry would drop one unlucky request back onto the slow path.
+   */
+  private static async computeAndCacheFields(projectId: string): Promise<ContactFieldList> {
+    const entry: ContactFieldList = {
+      fields: await this.computeAvailableFields(projectId),
+      computedAt: new Date().toISOString(),
+    };
+
+    await redis.set(Keys.Contact.fields(projectId), JSON.stringify(entry), 'EX', this.fieldsTtlSeconds * 2);
+
+    return entry;
+  }
+
+  /**
+   * Recompute under a lock, so a project runs one scan at a time.
+   *
+   * Without it, a dashboard opened in five tabs at the expiry boundary would start five
+   * full scans of the same table. Returns null when another scan already holds the lock.
+   */
+  private static async recomputeFields(projectId: string): Promise<ContactFieldList | null> {
+    const lock = Keys.Contact.fieldsRefreshLock(projectId);
+    const acquired = await redis.set(lock, '1', 'EX', this.FIELDS_REFRESH_LOCK_SECONDS, 'NX');
+
+    if (!acquired) {
+      return null;
+    }
+
+    try {
+      return await this.computeAndCacheFields(projectId);
+    } finally {
+      await redis.del(lock);
+    }
+  }
+
+  /** Recompute without anyone waiting on it. */
+  private static async refreshFieldsInBackground(projectId: string): Promise<void> {
+    try {
+      await this.recomputeFields(projectId);
+    } catch (error) {
+      // Nothing is waiting on this and the stale entry was already served, so a failure
+      // here costs a stale dropdown until the next attempt, not a failed request.
+      signale.error('[CONTACTS] Background refresh of available fields failed:', error);
+    }
+  }
+
+  /**
+   * The scan behind the cache.
+   *
+   * One pass over the project's contacts. Each contact's `data` is expanded exactly once
+   * with `jsonb_each`, and every key's coverage, type and sample value comes out of that
+   * single expansion.
+   *
+   * What this replaced discovered the keys, then joined them back against the whole
+   * contact set to count them and probed it again for a sample value -- so the table was
+   * re-read once per field and every row's jsonb was parsed once per field. Cost grew
+   * with contacts x fields, which at 2M contacts and ~30 custom fields is the minute the
+   * issue reported. See packages/db/benchmarks/contact-fields for the measurements.
+   *
+   * The count runs alongside the scan rather than before it: Prisma issues them on
+   * separate connections, so the two overlap instead of adding up.
+   */
+  private static async computeAvailableFields(projectId: string): Promise<ContactField[]> {
+    const [totalContacts, rows] = await Promise.all([
+      prisma.contact.count({where: {projectId}}),
+      prisma.$queryRaw<
+        Array<{
+          key: string;
+          contact_count: bigint;
+          type_min: string | null;
+          type_max: string | null;
+          sample_value: string | null;
+        }>
+      >`
         SELECT
-          fk.key,
-          jsonb_typeof(c.data->fk.key) as json_type,
-          (c.data->>fk.key) as sample_value
-        FROM field_keys fk
-        CROSS JOIN LATERAL (
-          SELECT data
-          FROM contacts
-          WHERE
-            "projectId" = ${projectId}
-            AND data ? fk.key
-            AND data->fk.key IS NOT NULL
-          LIMIT 1
-        ) c
-      ),
-      field_counts AS (
-        SELECT
-          fk.key,
-          COUNT(*) as contact_count
-        FROM field_keys fk
-        JOIN contacts c ON c."projectId" = ${projectId}
-          AND c.data ? fk.key
-          AND c.data->fk.key IS NOT NULL
-        GROUP BY fk.key
-      )
-      SELECT
-        fs.key,
-        fs.sample_value,
-        fs.json_type,
-        fc.contact_count
-      FROM field_samples fs
-      JOIN field_counts fc ON fc.key = fs.key
-    `;
+          kv.key AS key,
+          count(*) FILTER (WHERE kv.value <> 'null'::jsonb) AS contact_count,
+          min(jsonb_typeof(kv.value)) FILTER (WHERE kv.value <> 'null'::jsonb) AS type_min,
+          max(jsonb_typeof(kv.value)) FILTER (WHERE kv.value <> 'null'::jsonb) AS type_max,
+          min((kv.value #>> '{}') COLLATE "C") FILTER (WHERE kv.value <> 'null'::jsonb) AS sample_value
+        FROM contacts c
+        CROSS JOIN LATERAL jsonb_each(
+          CASE WHEN jsonb_typeof(c.data) = 'object' THEN c.data ELSE '{}'::jsonb END
+        ) kv
+        WHERE c."projectId" = ${projectId}
+        GROUP BY kv.key
+      `,
+    ]);
 
-    // Infer types from JSON types and sample values, calculate coverage
-    const customFields = result.map(row => {
-      let type: 'string' | 'number' | 'boolean' | 'date' = 'string';
+    // The null filters above are FILTERs rather than a WHERE so that a key whose values
+    // are all JSON null is still discovered and still offered in the pickers, while its
+    // coverage correctly reads 0. Note this is a behaviour change: the previous query
+    // tested `data->key IS NOT NULL`, which a stored JSON null passes -- so a field set
+    // to null on every contact used to report 100% coverage.
+    const customFields = rows.map(row => ({
+      field: `data.${row.key}`,
+      type: this.inferFieldType(row.type_min, row.type_max, row.sample_value),
+      coverage: totalContacts > 0 ? Math.round((Number(row.contact_count) / totalContacts) * 100) : 0,
+    }));
 
-      // PostgreSQL jsonb_typeof returns: "object", "array", "string", "number", "boolean", "null"
-      if (row.json_type === 'boolean') {
-        type = 'boolean';
-      } else if (row.json_type === 'number') {
-        type = 'number';
-      } else if (row.json_type === 'string' && row.sample_value) {
-        // Try to detect dates (ISO 8601 format)
-        const dateRegex = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{3})?Z?)?$/;
-        if (dateRegex.test(row.sample_value)) {
-          type = 'date';
-        }
-      }
+    return [...this.STANDARD_FIELDS, ...customFields].sort((a, b) => a.field.localeCompare(b.field));
+  }
 
-      // Calculate coverage percentage
-      const contactCount = Number(row.contact_count);
-      const coverage = totalContacts > 0 ? Math.round((contactCount / totalContacts) * 100) : 0;
+  /**
+   * Infer a field's type from the jsonb types seen across the whole project.
+   *
+   * `typeMin`/`typeMax` are the alphabetical extremes of `jsonb_typeof` over the field's
+   * non-null values, so equal means every contact stored the same type -- the case worth
+   * acting on. A field holding a mix (a number for some contacts, a string for others)
+   * falls back to `string`, the only operator set that works across all of it.
+   *
+   * A min/max pair rather than an exact `mode()` because `mode()` is an ordered-set
+   * aggregate: it would sort every expanded key/value pair, costing more than the scan
+   * carrying it. min and max are plain aggregates over the same pass.
+   */
+  private static inferFieldType(
+    typeMin: string | null,
+    typeMax: string | null,
+    sampleValue: string | null,
+  ): ContactFieldType {
+    if (typeMin === null || typeMin !== typeMax) {
+      return 'string';
+    }
 
-      return {
-        field: `data.${row.key}`,
-        type,
-        coverage,
-      };
-    });
+    if (typeMin === 'boolean') {
+      return 'boolean';
+    }
 
-    return [...standardFields, ...customFields].sort((a, b) => a.field.localeCompare(b.field));
+    if (typeMin === 'number') {
+      return 'number';
+    }
+
+    if (typeMin === 'string' && sampleValue && ContactService.ISO_DATE.test(sampleValue)) {
+      return 'date';
+    }
+
+    return 'string';
   }
 
   /**
@@ -1035,6 +1190,10 @@ export class ContactService {
         "projectId" = ${projectId}
         AND data ? ${jsonField}
     `;
+
+    // The key is gone from every contact; a cached list would keep offering it in the
+    // segment builder and the template editor for hours.
+    await this.invalidateAvailableFields(projectId);
 
     return {deletedFrom: result};
   }

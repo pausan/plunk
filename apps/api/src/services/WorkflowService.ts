@@ -1366,8 +1366,9 @@ export class WorkflowService {
    * Get all available fields for workflow conditions (contact fields + event fields)
    */
   public static async getAvailableFields(projectId: string, eventName?: string) {
-    // Get contact fields with types (standard + custom data fields)
-    const contactFieldsWithTypes = await ContactService.getAvailableFields(projectId);
+    // Get contact fields with types (standard + custom data fields). Cached per project;
+    // see ContactService.getAvailableFields.
+    const {fields: contactFieldsWithTypes} = await ContactService.getAvailableFields(projectId);
 
     // Build typed field list with 'contact.' prefix
     const contactFields = contactFieldsWithTypes.map(f => ({
