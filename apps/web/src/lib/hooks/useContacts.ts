@@ -1,6 +1,9 @@
 import type {Contact} from '@plunk/db';
-import type {CursorPaginatedResponse, PaginatedResponse} from '@plunk/types';
+import type {ContactField, ContactFieldList, CursorPaginatedResponse, PaginatedResponse} from '@plunk/types';
+import {useCallback, useState} from 'react';
 import useSWR from 'swr';
+
+import {network} from '../network';
 
 interface UseContactsOptions {
   limit?: number;
@@ -10,12 +13,11 @@ interface UseContactsOptions {
 /** Stable identity so consumers' effect dependencies don't churn before the fetch lands. */
 const NO_FIELDS: ContactField[] = [];
 
-/** A contact field as reported by `GET /contacts/fields`. */
-export interface ContactField {
-  field: string;
-  type: 'string' | 'number' | 'boolean' | 'date';
-  /** Percentage of the project's contacts that carry this field. */
-  coverage: number;
+export type {ContactField};
+
+/** The `GET /contacts/fields` payload. */
+interface ContactFieldsResponse extends ContactFieldList {
+  count: number;
 }
 
 /**
@@ -74,14 +76,40 @@ export function useSegmentContacts(segmentId?: string, pageSize = 50) {
 }
 
 /**
- * Hook to fetch available contact fields for variable usage
+ * Hook to fetch available contact fields for variable usage.
+ *
+ * The server computes this list by scanning the project's contacts and then caches it
+ * for hours, so a field written for the first time a minute ago may not be in it yet.
+ * `computedAt` says how old the list is and `refresh` forces a rescan — see
+ * ContactService.getAvailableFields.
  */
 export function useContactFields() {
-  const {data, error, mutate, isLoading} = useSWR<{fields: ContactField[]; count: number}>('/contacts/fields', {
+  const {data, error, mutate, isLoading} = useSWR<ContactFieldsResponse>('/contacts/fields', {
     revalidateOnFocus: false,
     // Cache fields for longer since they don't change often
     dedupingInterval: 60000, // 1 minute
   });
+
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  /**
+   * Ask the server to rescan for custom fields and adopt the result.
+   *
+   * Writes the response straight into the SWR cache with `revalidate: false`: the POST
+   * already returns the newly computed list, so revalidating would immediately re-fetch
+   * what we are holding.
+   */
+  const refresh = useCallback(async () => {
+    setIsRefreshing(true);
+
+    try {
+      const refreshed = await network.fetch<ContactFieldsResponse>('POST', '/contacts/fields/refresh');
+      await mutate(refreshed, {revalidate: false});
+      return refreshed;
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [mutate]);
 
   const fieldDetails = data?.fields ?? NO_FIELDS;
   const fieldNames = fieldDetails.map(f => f.field);
@@ -92,8 +120,12 @@ export function useContactFields() {
     // carry each field. The editor's suggestion menus use both: a field only 4% of
     // contacts have is the difference between a working template and a silent blank.
     fieldDetails,
+    /** ISO timestamp of the scan behind this list, or undefined before it loads. */
+    computedAt: data?.computedAt,
     error,
     isLoading,
+    isRefreshing,
+    refresh,
     mutate,
   };
 }

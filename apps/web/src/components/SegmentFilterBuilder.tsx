@@ -13,9 +13,13 @@ import {
   SelectValue,
 } from '@plunk/ui';
 import type {FilterCondition, FilterGroup, SegmentFilter, SegmentFilterOperator} from '@plunk/types';
-import {Check, ChevronsUpDown, GripVertical, Plus, Search, Trash2} from 'lucide-react';
-import {memo, useCallback, useEffect, useMemo, useState} from 'react';
-import {network} from '../lib/network';
+import {Check, ChevronsUpDown, GripVertical, Plus, RefreshCw, Search, Trash2} from 'lucide-react';
+import {memo, useCallback, useMemo, useState} from 'react';
+import {toast} from 'sonner';
+import useSWR from 'swr';
+
+import {useContactFields} from '../lib/hooks/useContacts';
+import {formatRelativeTime} from '../lib/dateUtils';
 
 const STANDARD_OPERATORS: {value: SegmentFilterOperator; label: string; description: string}[] = [
   {value: 'equals', label: 'Equals', description: 'Exact match'},
@@ -67,84 +71,122 @@ interface FieldOption {
   category: 'Contact fields' | 'Custom data' | 'Events' | 'Email activity' | 'Segments';
 }
 
-// Hook to fetch available fields, events, and segments
+interface SegmentOption {
+  id: string;
+  name: string;
+  memberCount: number;
+}
+
+/**
+ * The fields, events and segments a filter row can be built from.
+ *
+ * All three go through SWR rather than a fetch inside an effect, so reopening the
+ * segment editor reuses what the previous mount already loaded instead of re-asking.
+ * `/contacts/fields` is the one that matters: the server builds it by scanning every
+ * contact in the project, and firing that uncached on every mount is what made this
+ * dialog take a minute (#487).
+ */
 function useAvailableOptions(currentSegmentId?: string) {
-  const [fields, setFields] = useState<FieldOption[]>([...STANDARD_FIELDS]);
-  const [loading, setLoading] = useState(true);
+  const {
+    fieldDetails,
+    computedAt,
+    isLoading: fieldsLoading,
+    isRefreshing,
+    refresh: refreshFields,
+  } = useContactFields();
 
-  useEffect(() => {
-    const fetchOptions = async () => {
-      try {
-        // Fetch contact fields with types, event names, and segments in parallel
-        const [fieldsData, eventsData, segmentsData] = await Promise.all([
-          network.fetch<{
-            fields: Array<{field: string; type: 'string' | 'number' | 'boolean' | 'date'}>;
-          }>('GET', '/contacts/fields'),
-          network.fetch<{eventNames: string[]}>('GET', '/events/names'),
-          network.fetch<Array<{id: string; name: string; memberCount: number}>>('GET', '/segments'),
-        ]);
+  const {
+    data: eventsData,
+    isLoading: eventsLoading,
+    mutate: mutateEvents,
+  } = useSWR<{eventNames: string[]}>('/events/names', {
+    revalidateOnFocus: false,
+    dedupingInterval: 60000,
+  });
 
-        // Build field options from typed fields
-        const typedFields: FieldOption[] = (fieldsData.fields || []).map(f => {
-          const isCustomData = f.field.startsWith('data.');
-          return {
-            value: f.field,
-            label: isCustomData ? f.field.replace('data.', '') : f.field,
-            type: f.type,
-            category: isCustomData ? ('Custom data' as const) : ('Contact fields' as const),
-          };
+  const {
+    data: segmentsData,
+    isLoading: segmentsLoading,
+    mutate: mutateSegments,
+  } = useSWR<SegmentOption[]>('/segments', {
+    revalidateOnFocus: false,
+    dedupingInterval: 60000,
+  });
+
+  const fields = useMemo<FieldOption[]>(() => {
+    // Build field options from typed fields
+    const typedFields: FieldOption[] = fieldDetails.map(f => {
+      const isCustomData = f.field.startsWith('data.');
+      return {
+        value: f.field,
+        label: isCustomData ? f.field.replace('data.', '') : f.field,
+        type: f.type,
+        category: isCustomData ? ('Custom data' as const) : ('Contact fields' as const),
+      };
+    });
+
+    // Build event options
+    const eventOptions: FieldOption[] = [];
+    const emailOptions: FieldOption[] = [];
+
+    (eventsData?.eventNames ?? []).forEach((name: string) => {
+      if (name.startsWith('email.')) {
+        emailOptions.push({
+          value: name,
+          label: name
+            .replace('email.', '')
+            .replace(/([A-Z])/g, ' $1')
+            .trim(),
+          type: 'event' as const,
+          category: 'Email activity' as const,
         });
-
-        // Build event options
-        const eventOptions: FieldOption[] = [];
-        const emailOptions: FieldOption[] = [];
-
-        (eventsData.eventNames || []).forEach((name: string) => {
-          if (name.startsWith('email.')) {
-            emailOptions.push({
-              value: name,
-              label: name
-                .replace('email.', '')
-                .replace(/([A-Z])/g, ' $1')
-                .trim(),
-              type: 'event' as const,
-              category: 'Email activity' as const,
-            });
-          } else {
-            // Ensure event has the 'event.' prefix for backend compatibility
-            const eventValue = name.startsWith('event.') ? name : `event.${name}`;
-            eventOptions.push({
-              value: eventValue,
-              label: name.replace(/^event\./, ''), // Remove prefix from label for display
-              type: 'event' as const,
-              category: 'Events' as const,
-            });
-          }
+      } else {
+        // Ensure event has the 'event.' prefix for backend compatibility
+        const eventValue = name.startsWith('event.') ? name : `event.${name}`;
+        eventOptions.push({
+          value: eventValue,
+          label: name.replace(/^event\./, ''), // Remove prefix from label for display
+          type: 'event' as const,
+          category: 'Events' as const,
         });
-
-        // Build segment options, excluding the current segment to prevent self-reference
-        const segmentOptions: FieldOption[] = (segmentsData || [])
-          .filter((s: {id: string; name: string; memberCount: number}) => s.id !== currentSegmentId)
-          .map((s: {id: string; name: string; memberCount: number}) => ({
-            value: `segment.${s.id}`,
-            label: s.name,
-            description: `${s.memberCount.toLocaleString()} ${s.memberCount === 1 ? 'person' : 'people'}`,
-            type: 'segment' as const,
-            category: 'Segments' as const,
-          }));
-
-        setFields([...typedFields, ...eventOptions, ...emailOptions, ...segmentOptions]);
-      } catch (error) {
-        console.error('Failed to fetch available fields and events:', error);
-      } finally {
-        setLoading(false);
       }
-    };
+    });
 
-    fetchOptions();
-  }, [currentSegmentId]);
+    // Build segment options, excluding the current segment to prevent self-reference
+    const segmentOptions: FieldOption[] = (segmentsData ?? [])
+      .filter(s => s.id !== currentSegmentId)
+      .map(s => ({
+        value: `segment.${s.id}`,
+        label: s.name,
+        description: `${s.memberCount.toLocaleString()} ${s.memberCount === 1 ? 'person' : 'people'}`,
+        type: 'segment' as const,
+        category: 'Segments' as const,
+      }));
 
-  return {fields, loading};
+    // The endpoint returns the standard columns alongside the custom ones, so this falls
+    // back to the local copy only when that request failed -- leaving the builder usable
+    // on email/subscribed/createdAt rather than empty.
+    const contactFields = typedFields.length > 0 ? typedFields : [...STANDARD_FIELDS];
+
+    return [...contactFields, ...eventOptions, ...emailOptions, ...segmentOptions];
+  }, [fieldDetails, eventsData, segmentsData, currentSegmentId]);
+
+  /**
+   * Rescan for custom fields, picking up new events and segments in the same gesture:
+   * someone pressing "Refresh fields" after wiring up a new integration means "show me
+   * what I just started sending", which is rarely only the contact fields.
+   */
+  const refresh = useCallback(async () => {
+    await Promise.all([refreshFields(), mutateEvents(), mutateSegments()]);
+  }, [refreshFields, mutateEvents, mutateSegments]);
+
+  return {
+    fields,
+    loading: fieldsLoading || eventsLoading || segmentsLoading,
+    computedAt,
+    isRefreshing,
+    refresh,
+  };
 }
 
 interface FilterRowProps {
@@ -807,11 +849,50 @@ interface SegmentFilterBuilderProps {
 }
 
 export function SegmentFilterBuilder({condition, onChange, currentSegmentId}: SegmentFilterBuilderProps) {
-  const {fields, loading} = useAvailableOptions(currentSegmentId);
+  const {fields, loading, computedAt, isRefreshing, refresh} = useAvailableOptions(currentSegmentId);
+
+  const handleRefresh = useCallback(async () => {
+    try {
+      await refresh();
+      toast.success('Field list updated');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Couldn’t refresh the field list. Try again.');
+    }
+  }, [refresh]);
 
   if (loading) {
     return <div className="text-sm text-neutral-500 py-4">Loading available fields and events...</div>;
   }
 
-  return <FilterConditionComponent condition={condition} onChange={onChange} availableFields={fields} />;
+  return (
+    <div className="space-y-3">
+      {/*
+        The custom-field list is built by scanning every contact in the project, so it is
+        cached server-side and can lag a field that started being written minutes ago.
+        Saying how old it is, and offering the rescan, is what keeps that trade honest --
+        otherwise someone who just added a field sees it missing with no way to explain
+        or fix it.
+      */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs text-neutral-500">
+          {computedAt
+            ? `Field list last scanned ${formatRelativeTime(computedAt)}`
+            : 'Field list from the most recent scan'}
+        </span>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={handleRefresh}
+          disabled={isRefreshing}
+          title="Rescan contacts for custom fields. Takes a few seconds on large projects."
+        >
+          <RefreshCw className={`h-3 w-3 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
+          {isRefreshing ? 'Rescanning…' : 'Refresh fields'}
+        </Button>
+      </div>
+
+      <FilterConditionComponent condition={condition} onChange={onChange} availableFields={fields} />
+    </div>
+  );
 }
